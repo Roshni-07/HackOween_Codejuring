@@ -20,11 +20,12 @@ class SimulationEngine:
         self.robot_heading = 0.0  # Degrees (0 = facing +X)
         self.state_name = "Idle"
         self.held_object_id = None
+        self.pickup_constraint = None
         self.collided = False
         self.retries = 0
         self.debug_lines = []
 
-        # 1. Clean GUI Configuration for Video Capture & Live Demo
+        # Clean GUI Configuration for Video Capture & Live Demo
         if gui:
             p.resetDebugVisualizerCamera(
                 cameraDistance=4.8,
@@ -41,14 +42,14 @@ class SimulationEngine:
             )
             p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
 
-        # 2. Build World & Debug Visuals
+        # Build World & Visual Debugs
         self._build_room()
         self._spawn_shapes_and_dropzone()
         self._create_robot()
         self.update_debug_visuals()
 
     def _build_room(self):
-        """Build floor plane and 4 surrounding arena walls[cite: 2]."""
+        """Build floor plane and 4 surrounding arena walls."""
         p.loadURDF("plane.urdf")
         wall_height, wall_thick = 1.0, 0.1
         half_r = self.room_size / 2.0
@@ -73,7 +74,7 @@ class SimulationEngine:
             )
 
     def _spawn_shapes_and_dropzone(self):
-        """Spawn green drop zone platform and primitive objects[cite: 2]."""
+        """Spawn green drop zone platform and primitive objects."""
         self.drop_zone_pos = [1.8, 1.8, 0.005]
         drop_vis = p.createVisualShape(
             p.GEOM_BOX,
@@ -150,7 +151,7 @@ class SimulationEngine:
             obj_id = p.createMultiBody(1.0, col, vis, basePosition=cfg["pos"])
             self.object_ids.append(obj_id)
 
-        # Apply high friction and linear damping to prevent endless sliding
+        # Apply high friction and linear damping to prevent sliding
         for obj_id in self.object_ids:
             p.changeDynamics(
                 obj_id,
@@ -167,7 +168,7 @@ class SimulationEngine:
         p.changeDynamics(0, -1, lateralFriction=1.0)
 
     def _create_robot(self):
-        """Capsule robot base[cite: 2]."""
+        """Capsule robot base."""
         col = p.createCollisionShape(p.GEOM_CAPSULE, radius=0.25, height=0.2)
         vis = p.createVisualShape(
             p.GEOM_CAPSULE, radius=0.25, length=0.2, rgbaColor=[0.2, 0.2, 0.2, 1]
@@ -177,7 +178,7 @@ class SimulationEngine:
         )
 
     def get_camera_image(self):
-        """Render 640x480 JPEG (90 FOV, 0.5m height, 10 deg downward tilt)[cite: 3, 4]."""
+        """Render 640x480 JPEG (90 FOV, 0.5m height, 10 deg downward tilt)."""
         rad = math.radians(self.robot_heading)
         cam_height = 0.5
         tilt_rad = math.radians(10)
@@ -207,7 +208,7 @@ class SimulationEngine:
         return Image.fromarray(frame.astype("uint8"), "RGB")
 
     def update_debug_visuals(self):
-        """Draw 3D FOV frustum lines and pickup radius in PyBullet GUI[cite: 3, 5]."""
+        """Draw 3D FOV frustum lines and pickup radius in PyBullet GUI."""
         for line_id in self.debug_lines:
             p.removeUserDebugItem(line_id)
         self.debug_lines.clear()
@@ -234,51 +235,61 @@ class SimulationEngine:
             )
             self.debug_lines.append(line_id)
 
-    def move_robot(self, distance):
-        """Move robot with boundary collision detection and 0.1m recoil[cite: 3]."""
-        rad = math.radians(self.robot_heading)
-        target_x = self.robot_pos[0] + distance * math.cos(rad)
-        target_y = self.robot_pos[1] + distance * math.sin(rad)
+    def check_physical_collisions(self):
+        """Detect real physical mesh contacts against walls, obstacles, or floor items."""
+        contacts = p.getContactPoints(bodyA=self.robot_id)
+        for c in contacts:
+            touching_body = c[2]
+            # Ignore floor plane (0) and currently held object
+            if touching_body != 0 and touching_body != self.held_object_id:
+                return True
+        return False
 
-        if abs(target_x) > 2.25 or abs(target_y) > 2.25:
-            self.collided = True
-            self.state_name = "Blocked"
-            self.robot_pos[0] -= 0.1 * math.cos(rad)
-            self.robot_pos[1] -= 0.1 * math.sin(rad)
+    def move_robot(self, distance):
+        """Move robot using interpolated sub-stepping and collision detection."""
+        rad = math.radians(self.robot_heading)
+        num_steps = 15
+        step_dist = distance / num_steps
+
+        for _ in range(num_steps):
+            target_x = self.robot_pos[0] + step_dist * math.cos(rad)
+            target_y = self.robot_pos[1] + step_dist * math.sin(rad)
+
+            # Check hard arena boundaries and mesh contact points
+            if abs(target_x) > 2.25 or abs(target_y) > 2.25 or self.check_physical_collisions():
+                self.collided = True
+                self.state_name = "Blocked"
+                # Apply 0.1m recoil away from impact
+                self.robot_pos[0] -= 0.1 * math.cos(rad)
+                self.robot_pos[1] -= 0.1 * math.sin(rad)
+                p.resetBasePositionAndOrientation(
+                    self.robot_id, self.robot_pos, [0, 0, 0, 1]
+                )
+                self.update_debug_visuals()
+                return {"moved": round(distance * 0.5, 2), "collided": True}
+
+            self.robot_pos[0] = target_x
+            self.robot_pos[1] = target_y
             p.resetBasePositionAndOrientation(
                 self.robot_id, self.robot_pos, [0, 0, 0, 1]
             )
-            self.update_debug_visuals()
-            return {"moved": round(distance * 0.5, 2), "collided": True}
+            p.stepSimulation()
 
-        actual_moved = math.hypot(
-            target_x - self.robot_pos[0], target_y - self.robot_pos[1]
-        )
-        self.robot_pos[0] = target_x
-        self.robot_pos[1] = target_y
-        p.resetBasePositionAndOrientation(
-            self.robot_id, self.robot_pos, [0, 0, 0, 1]
-        )
         self.collided = False
-
-        if self.held_object_id:
-            hold_x = self.robot_pos[0] + 0.35 * math.cos(rad)
-            hold_y = self.robot_pos[1] + 0.35 * math.sin(rad)
-            p.resetBasePositionAndOrientation(
-                self.held_object_id, [hold_x, hold_y, 0.25], [0, 0, 0, 1]
-            )
-
         self.update_debug_visuals()
-        return {"moved": round(actual_moved, 2), "collided": False}
+        return {"moved": round(distance, 2), "collided": False}
 
     def turn_robot(self, degrees):
-        """Turn robot in place (positive degrees = right / clockwise)[cite: 3, 4]."""
+        """Turn robot in place (positive degrees = right / clockwise)."""
         self.robot_heading = (self.robot_heading + degrees) % 360
+        rad = math.radians(self.robot_heading)
+        orn = p.getQuaternionFromEuler([0, 0, -rad])
+        p.resetBasePositionAndOrientation(self.robot_id, self.robot_pos, orn)
         self.update_debug_visuals()
         return {"heading": round(self.robot_heading, 1)}
 
     def pickup_object(self):
-        """Snap object to front if within 0.5m and +-30 deg heading[cite: 3]."""
+        """Attach nearest object within 0.5m and +-30 deg using a rigid PyBullet constraint."""
         if self.held_object_id:
             return {"ok": False}
 
@@ -295,14 +306,30 @@ class SimulationEngine:
             if dist <= 0.5 and heading_diff <= 30:
                 self.held_object_id = obj_id
                 self.state_name = "Carry"
+
+                # Lock object 0.35m in front of robot via fixed constraint
+                self.pickup_constraint = p.createConstraint(
+                    parentBodyUniqueId=self.robot_id,
+                    parentLinkIndex=-1,
+                    childBodyUniqueId=obj_id,
+                    childLinkIndex=-1,
+                    jointType=p.JOINT_FIXED,
+                    jointAxis=[0, 0, 0],
+                    parentFramePosition=[0.35, 0, 0.1],
+                    childFramePosition=[0, 0, 0],
+                )
                 return {"ok": True}
 
         return {"ok": False}
 
     def drop_object(self):
-        """Release held object and check drop zone placement[cite: 3]."""
+        """Release fixed physics constraint and check drop zone placement."""
         if not self.held_object_id:
             return {"ok": False, "in_zone": False}
+
+        if hasattr(self, "pickup_constraint") and self.pickup_constraint is not None:
+            p.removeConstraint(self.pickup_constraint)
+            self.pickup_constraint = None
 
         pos, _ = p.getBasePositionAndOrientation(self.held_object_id)
         dx = abs(pos[0] - self.drop_zone_pos[0])
@@ -314,9 +341,13 @@ class SimulationEngine:
         return {"ok": True, "in_zone": in_drop_zone}
 
     def reset_scene(self, seed=None):
-        """Resets robot state and scrambles object locations deterministically or randomly[cite: 2]."""
+        """Resets robot state and scrambles object locations deterministically or randomly."""
         if seed is not None:
             random.seed(seed)
+
+        if hasattr(self, "pickup_constraint") and self.pickup_constraint is not None:
+            p.removeConstraint(self.pickup_constraint)
+            self.pickup_constraint = None
 
         placed_positions = [[0.0, 0.0]]
 
@@ -352,7 +383,7 @@ class SimulationEngine:
         return {"status": "reset_complete"}
 
     def enable_obstacle_mode(self):
-        """Spawns internal wall blocking direct path from origin to drop zone for stretch goal testing[cite: 5]."""
+        """Spawns internal wall blocking direct path from origin to drop zone for stretch goal testing."""
         wall_col = p.createCollisionShape(
             p.GEOM_BOX, halfExtents=[0.1, 0.8, 0.5]
         )

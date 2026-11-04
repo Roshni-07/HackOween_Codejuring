@@ -4,6 +4,7 @@ import os
 import json
 from datetime import datetime
 import math
+import base64
 
 app = FastAPI(title="Hackathon Engine API")
 
@@ -14,12 +15,18 @@ robot_state = {
     "is_rendering": False  # Clock-sync flag added
 }
 
+# Live frame stored in RAM to prevent file-locking crashes
+current_frame_bytes = None
+
 class MoveRequest(BaseModel):
     distance: float
     simulate_collision: bool = False
 
 class TurnRequest(BaseModel):
     degrees: float
+
+class FrameUpdate(BaseModel):
+    image_base64: str
 
 # --- JSONL LOGGER ---
 def log_step(action, args, result):
@@ -39,22 +46,37 @@ def get_state():
 
 @app.get("/look")
 def get_look():
-    if not os.path.exists("dummy.jpg"):
-        return Response(content=b"fake_image_bytes", media_type="image/jpeg")
-    with open("dummy.jpg", "rb") as f:
-        return Response(content=f.read(), media_type="image/jpeg")
+    global current_frame_bytes
+    
+    # 1. Serve the live RAM frame from Teammate 2 if available
+    if current_frame_bytes:
+        return Response(content=current_frame_bytes, media_type="image/jpeg")
+        
+    # 2. Fallback to the static file if the engine hasn't sent a frame yet
+    if os.path.exists("dummy.jpg"):
+        with open("dummy.jpg", "rb") as f:
+            return Response(content=f.read(), media_type="image/jpeg")
+            
+    return Response(content=b"fake_image_bytes", media_type="image/jpeg")
 
 @app.get("/depth")
 def get_depth():
     return {"distance": 5.0}
 
-# --- ENGINE CLOCK-SYNC ---
+# --- ENGINE CLOCK-SYNC & FRAME PIPELINE ---
 @app.post("/engine/render_complete")
 def render_complete():
     """Teammate 2 calls this when the 3D engine finishes rendering."""
     global robot_state
     robot_state["is_rendering"] = False
     return {"success": True, "message": "Engine ready for next command"}
+
+@app.post("/update_frame")
+def update_frame(req: FrameUpdate):
+    """Teammate 2 sends live base64 camera frames here."""
+    global current_frame_bytes
+    current_frame_bytes = base64.b64decode(req.image_base64)
+    return {"success": True, "message": "Frame updated in memory"}
 
 # --- ACTION ENDPOINTS ---
 @app.post("/move")

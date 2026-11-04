@@ -1,0 +1,22 @@
+# Virtual Environment
+sim_env/
+venv/
+env/
+
+# Python Cache & Artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Test Output Images & Frame Captures
+*.jpg
+*.png
+!assets/*.png
+
+# Execution & Log Artifacts
+*.jsonl
+*.mp4
+
+# IDE Configurations
+.vscode/
+.idea/

@@ -1,43 +1,70 @@
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from io import BytesIO
 from PIL import Image
 
+from logger import StepLogger
 
-class StepLogger:
 
-    def __init__(self, run_name):
+# Create a fresh test run
+logger = StepLogger("logger_upgrade_test")
 
-        self.run_dir = Path("Logs") / run_name
-        self.frames_dir = self.run_dir / "frames"
 
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
+# Test 1: Successful robot action
+logger.log_step(
+    tool="move",
+    args={"distance": 1.0},
+    result={"success": True}
+)
 
-        self.log_file = self.run_dir / "steps.jsonl"
 
-    def log_step(self, step, tool, args, result, frame_path=None):
+# Test 2: Failed robot action
+logger.log_step(
+    tool="turn",
+    args={"degrees": 90},
+    result={"success": False, "error": "Test failure"}
+)
 
-        entry = {
-            "step": step,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tool": tool,
-            "args": args,
-            "result": result,
-            "frame_path": frame_path
-        }
 
-        with open(self.log_file, "a", encoding="utf-8") as file:
-            file.write(json.dumps(entry) + "\n")
+# Test 3: Create a sample JPEG camera image
+sample_image = Image.new("RGB", (640, 480), color="blue")
 
-    def save_frame(self, step, image_bytes):
+image_buffer = BytesIO()
+sample_image.save(image_buffer, format="JPEG")
 
-        image = Image.open(BytesIO(image_bytes))
-        image = image.convert("RGB")
+jpeg_bytes = image_buffer.getvalue()
 
-        frame_file = self.frames_dir / f"frame_{step:04d}.png"
 
-        image.save(frame_file, format="PNG")
+# Save JPEG image as PNG
+frame_path = logger.save_frame(2, jpeg_bytes)
 
-        return str(frame_file)
+
+# Test 4: Record the camera frame path
+logger.log_step(
+    tool="look",
+    args={},
+    result={"success": True},
+    frame_path=frame_path
+)
+
+
+# Verify the log file
+log_file = Path("Logs/logger_upgrade_test/steps.jsonl")
+
+with open(log_file, "r", encoding="utf-8") as file:
+    entries = [json.loads(line) for line in file]
+
+
+print("Total logged steps:", len(entries))
+print("Step numbers:", [entry["step"] for entry in entries])
+print("Failed action recorded:", entries[1]["result"]["success"] is False)
+
+# Verify actual PNG format
+saved_image = Image.open(frame_path)
+
+print("Saved image format:", saved_image.format)
+print("Saved image dimensions:", saved_image.size)
+
+print("\nALL TESTS COMPLETED!")
+

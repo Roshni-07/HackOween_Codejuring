@@ -1,13 +1,17 @@
 from fastapi import FastAPI, Response
 from pydantic import BaseModel
 import os
+import json
+from datetime import datetime
+import math
 
 app = FastAPI(title="Hackathon Engine API")
 
-# Your State Machine tracking
+# State Machine tracking
 robot_state = {
     "x": 0.0, "y": 0.0, "heading": 0.0, 
-    "holding": False, "retry_count": 0, "state": "Idle"
+    "holding": False, "retry_count": 0, "state": "Idle",
+    "is_rendering": False  # Clock-sync flag added
 }
 
 class MoveRequest(BaseModel):
@@ -17,13 +21,24 @@ class MoveRequest(BaseModel):
 class TurnRequest(BaseModel):
     degrees: float
 
+# --- JSONL LOGGER ---
+def log_step(action, args, result):
+    with open("run_log.jsonl", "a") as f:
+        log_entry = {
+            "timestamp": datetime.now().isoformat(), 
+            "action": action, 
+            "args": args, 
+            "result": result
+        }
+        f.write(json.dumps(log_entry) + "\n")
+
+# --- GET ENDPOINTS ---
 @app.get("/state")
 def get_state():
     return robot_state
 
 @app.get("/look")
 def get_look():
-    # Returns a dummy image for now. Prevents crashing if the file is missing.
     if not os.path.exists("dummy.jpg"):
         return Response(content=b"fake_image_bytes", media_type="image/jpeg")
     with open("dummy.jpg", "rb") as f:
@@ -33,14 +48,32 @@ def get_look():
 def get_depth():
     return {"distance": 5.0}
 
-@app.post("/move")
+# --- ENGINE CLOCK-SYNC ---
+@app.post("/engine/render_complete")
+def render_complete():
+    """Teammate 2 calls this when the 3D engine finishes rendering."""
+    global robot_state
+    robot_state["is_rendering"] = False
+    return {"success": True, "message": "Engine ready for next command"}
+
+# --- ACTION ENDPOINTS ---
 @app.post("/move")
 def move(req: MoveRequest):
     global robot_state
     
+    # 1. Clock-sync check
+    if robot_state.get("is_rendering"):
+        result = {"success": False, "message": "Engine is rendering. Wait."}
+        log_step("move", {"distance": req.distance}, result)
+        return result
+        
+    # 2. Blocked state check
     if robot_state["state"] == "Blocked":
-        return {"success": False, "message": "Robot is blocked. Must turn to reset."}
+        result = {"success": False, "message": "Robot is blocked. Must turn to reset."}
+        log_step("move", {"distance": req.distance}, result)
+        return result
 
+    # 3. Collision simulation
     if req.simulate_collision:
         robot_state["retry_count"] += 1
         robot_state["x"] -= 0.1
@@ -48,36 +81,75 @@ def move(req: MoveRequest):
         if robot_state["retry_count"] >= 3:
             robot_state["state"] = "Blocked"
             
-        return {"success": False, "collided": True, "distance_moved": -0.1, "retries": robot_state["retry_count"]}
+        result = {"success": False, "collided": True, "distance_moved": -0.1, "retries": robot_state["retry_count"]}
+        log_step("move", {"distance": req.distance, "simulate_collision": True}, result)
+        return result
     
+    # 4. Successful move
     robot_state["retry_count"] = 0
     robot_state["state"] = "Go to object"
     
-    import math
     rad = math.radians(robot_state["heading"])
     robot_state["x"] += req.distance * math.sin(rad)
     robot_state["y"] += req.distance * math.cos(rad)
     
-    return {"success": True, "collided": False, "distance_moved": req.distance}
+    robot_state["is_rendering"] = True  # Lock until 3D engine renders
+    
+    result = {"success": True, "collided": False, "distance_moved": req.distance}
+    log_step("move", {"distance": req.distance}, result)
+    return result
+
 @app.post("/turn")
 def turn(req: TurnRequest):
     global robot_state
+    
+    if robot_state.get("is_rendering"):
+        result = {"success": False, "message": "Engine is rendering. Wait."}
+        log_step("turn", {"degrees": req.degrees}, result)
+        return result
+        
     robot_state["heading"] += req.degrees
     
     if robot_state["state"] == "Blocked":
         robot_state["state"] = "Idle"
         robot_state["retry_count"] = 0
         
-    return {"success": True, "degrees_turned": req.degrees}
+    robot_state["is_rendering"] = True
+    
+    result = {"success": True, "degrees_turned": req.degrees}
+    log_step("turn", {"degrees": req.degrees}, result)
+    return result
 
 @app.post("/pickup")
 def pickup():
+    global robot_state
+    
+    if robot_state.get("is_rendering"):
+        result = {"success": False, "message": "Engine is rendering. Wait."}
+        log_step("pickup", {}, result)
+        return result
+        
     robot_state["holding"] = True
     robot_state["state"] = "Carry"
-    return {"success": True}
+    robot_state["is_rendering"] = True
+    
+    result = {"success": True}
+    log_step("pickup", {}, result)
+    return result
 
 @app.post("/drop")
 def drop():
+    global robot_state
+    
+    if robot_state.get("is_rendering"):
+        result = {"success": False, "message": "Engine is rendering. Wait."}
+        log_step("drop", {}, result)
+        return result
+        
     robot_state["holding"] = False
     robot_state["state"] = "Done"
-    return {"success": True, "in_drop_zone": True}
+    robot_state["is_rendering"] = True
+    
+    result = {"success": True, "in_drop_zone": True}
+    log_step("drop", {}, result)
+    return result

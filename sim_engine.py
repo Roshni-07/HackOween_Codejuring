@@ -1,4 +1,5 @@
 import math
+import random
 import time
 import numpy as np
 import pybullet as p
@@ -21,10 +22,30 @@ class SimulationEngine:
         self.held_object_id = None
         self.collided = False
         self.retries = 0
+        self.debug_lines = []
 
+        # 1. Clean GUI Configuration for Video Capture & Live Demo
+        if gui:
+            p.resetDebugVisualizerCamera(
+                cameraDistance=4.8,
+                cameraYaw=45,
+                cameraPitch=-45,
+                cameraTargetPosition=[0, 0, 0],
+            )
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+            p.configureDebugVisualizer(
+                p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0
+            )
+            p.configureDebugVisualizer(
+                p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0
+            )
+            p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
+
+        # 2. Build World & Debug Visuals
         self._build_room()
         self._spawn_shapes_and_dropzone()
         self._create_robot()
+        self.update_debug_visuals()
 
     def _build_room(self):
         """Build floor plane and 4 surrounding arena walls[cite: 2]."""
@@ -67,32 +88,32 @@ class SimulationEngine:
             {
                 "type": p.GEOM_BOX,
                 "size": [0.15, 0.15, 0.15],
-                "color": [1, 0, 0, 1],
+                "color": [0.9, 0.1, 0.1, 1],
                 "pos": [1.5, 0.5, 0.15],
             },  # Red Box
             {
                 "type": p.GEOM_BOX,
                 "size": [0.15, 0.15, 0.15],
-                "color": [0, 0, 1, 1],
+                "color": [0.1, 0.3, 0.9, 1],
                 "pos": [1.0, -1.0, 0.15],
             },  # Blue Box
+            {
+                "type": p.GEOM_SPHERE,
+                "radius": 0.15,
+                "color": [0.9, 0.1, 0.1, 1],
+                "pos": [1.8, -0.6, 0.15],
+            },  # Red Sphere
             {
                 "type": p.GEOM_CYLINDER,
                 "radius": 0.12,
                 "length": 0.3,
-                "color": [1, 0, 0, 1],
-                "pos": [2.0, -0.4, 0.15],
-            },  # Red Cylinder
-            {
-                "type": p.GEOM_SPHERE,
-                "radius": 0.15,
-                "color": [1, 0.8, 0, 1],
+                "color": [0.9, 0.8, 0.0, 1],
                 "pos": [0.5, 1.5, 0.15],
-            },  # Yellow Sphere
+            },  # Yellow Cylinder
             {
                 "type": p.GEOM_SPHERE,
                 "radius": 0.15,
-                "color": [0.5, 0, 0.5, 1],
+                "color": [0.6, 0.1, 0.8, 1],
                 "pos": [-1.2, 1.0, 0.15],
             },  # Purple Sphere
         ]
@@ -128,6 +149,22 @@ class SimulationEngine:
 
             obj_id = p.createMultiBody(1.0, col, vis, basePosition=cfg["pos"])
             self.object_ids.append(obj_id)
+
+        # Apply high friction and linear damping to prevent endless sliding
+        for obj_id in self.object_ids:
+            p.changeDynamics(
+                obj_id,
+                -1,
+                mass=1.0,
+                lateralFriction=0.8,
+                spinningFriction=0.1,
+                rollingFriction=0.1,
+                linearDamping=0.5,
+                angularDamping=0.5,
+            )
+
+        # High ground plane friction
+        p.changeDynamics(0, -1, lateralFriction=1.0)
 
     def _create_robot(self):
         """Capsule robot base[cite: 2]."""
@@ -169,6 +206,34 @@ class SimulationEngine:
         frame = np.reshape(rgb_img, (480, 640, 4))[:, :, :3]
         return Image.fromarray(frame.astype("uint8"), "RGB")
 
+    def update_debug_visuals(self):
+        """Draw 3D FOV frustum lines and pickup radius in PyBullet GUI[cite: 3, 5]."""
+        for line_id in self.debug_lines:
+            p.removeUserDebugItem(line_id)
+        self.debug_lines.clear()
+
+        rx, ry = self.robot_pos[0], self.robot_pos[1]
+
+        # 1. Draw 0.5m pickup sector lines (+-30 deg) in RED
+        for angle_offset in [-30, 30]:
+            cone_rad = math.radians(self.robot_heading + angle_offset)
+            ex = rx + 0.5 * math.cos(cone_rad)
+            ey = ry + 0.5 * math.sin(cone_rad)
+            line_id = p.addUserDebugLine(
+                [rx, ry, 0.25], [ex, ey, 0.25], [1, 0, 0], lineWidth=2
+            )
+            self.debug_lines.append(line_id)
+
+        # 2. Draw 90 deg Camera FOV cone in CYAN
+        for angle_offset in [-45, 45]:
+            fov_rad = math.radians(self.robot_heading + angle_offset)
+            ex = rx + 2.0 * math.cos(fov_rad)
+            ey = ry + 2.0 * math.sin(fov_rad)
+            line_id = p.addUserDebugLine(
+                [rx, ry, 0.5], [ex, ey, 0.1], [0, 1, 1], lineWidth=1
+            )
+            self.debug_lines.append(line_id)
+
     def move_robot(self, distance):
         """Move robot with boundary collision detection and 0.1m recoil[cite: 3]."""
         rad = math.radians(self.robot_heading)
@@ -183,6 +248,7 @@ class SimulationEngine:
             p.resetBasePositionAndOrientation(
                 self.robot_id, self.robot_pos, [0, 0, 0, 1]
             )
+            self.update_debug_visuals()
             return {"moved": round(distance * 0.5, 2), "collided": True}
 
         actual_moved = math.hypot(
@@ -202,11 +268,13 @@ class SimulationEngine:
                 self.held_object_id, [hold_x, hold_y, 0.25], [0, 0, 0, 1]
             )
 
+        self.update_debug_visuals()
         return {"moved": round(actual_moved, 2), "collided": False}
 
     def turn_robot(self, degrees):
         """Turn robot in place (positive degrees = right / clockwise)[cite: 3, 4]."""
         self.robot_heading = (self.robot_heading + degrees) % 360
+        self.update_debug_visuals()
         return {"heading": round(self.robot_heading, 1)}
 
     def pickup_object(self):
@@ -220,7 +288,9 @@ class SimulationEngine:
             dist = math.hypot(pos[0] - rx, pos[1] - ry)
 
             angle_to_obj = math.degrees(math.atan2(pos[1] - ry, pos[0] - rx))
-            heading_diff = abs((angle_to_obj - self.robot_heading + 180) % 360 - 180)
+            heading_diff = abs(
+                (angle_to_obj - self.robot_heading + 180) % 360 - 180
+            )
 
             if dist <= 0.5 and heading_diff <= 30:
                 self.held_object_id = obj_id
@@ -242,6 +312,59 @@ class SimulationEngine:
         self.held_object_id = None
         self.state_name = "Done" if in_drop_zone else "Carry"
         return {"ok": True, "in_zone": in_drop_zone}
+
+    def reset_scene(self, seed=None):
+        """Resets robot state and scrambles object locations deterministically or randomly[cite: 2]."""
+        if seed is not None:
+            random.seed(seed)
+
+        placed_positions = [[0.0, 0.0]]
+
+        for obj_id in self.object_ids:
+            valid_pos = False
+            while not valid_pos:
+                rx = round(random.uniform(-1.8, 1.8), 2)
+                ry = round(random.uniform(-1.8, 1.8), 2)
+
+                dist_to_drop = math.hypot(
+                    rx - self.drop_zone_pos[0], ry - self.drop_zone_pos[1]
+                )
+                dist_to_others = [
+                    math.hypot(rx - px, ry - py) for px, py in placed_positions
+                ]
+
+                if dist_to_drop > 0.8 and all(d >= 0.6 for d in dist_to_others):
+                    valid_pos = True
+                    placed_positions.append([rx, ry])
+                    p.resetBasePositionAndOrientation(
+                        obj_id, [rx, ry, 0.15], [0, 0, 0, 1]
+                    )
+
+        self.robot_pos = [0.0, 0.0, 0.25]
+        self.robot_heading = 0.0
+        self.held_object_id = None
+        self.state_name = "Idle"
+        self.collided = False
+        p.resetBasePositionAndOrientation(
+            self.robot_id, self.robot_pos, [0, 0, 0, 1]
+        )
+        self.update_debug_visuals()
+        return {"status": "reset_complete"}
+
+    def enable_obstacle_mode(self):
+        """Spawns internal wall blocking direct path from origin to drop zone for stretch goal testing[cite: 5]."""
+        wall_col = p.createCollisionShape(
+            p.GEOM_BOX, halfExtents=[0.1, 0.8, 0.5]
+        )
+        wall_vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[0.1, 0.8, 0.5],
+            rgbaColor=[0.3, 0.3, 0.3, 1],
+        )
+        self.obstacle_id = p.createMultiBody(
+            0, wall_col, wall_vis, basePosition=[0.9, 0.9, 0.5]
+        )
+        print("Stretch Goal: Interior obstacle wall spawned!")
 
 
 if __name__ == "__main__":

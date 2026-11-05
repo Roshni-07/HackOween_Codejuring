@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Control Dashboard</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #121212; color: #fff; display: flex; gap: 40px; padding: 40px; justify-content: center; }
+        .panel { background: #1e1e1e; padding: 20px; border-radius: 12px; border: 1px solid #333; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .controls { display: grid; grid-template-columns: repeat(3, 80px); gap: 10px; justify-content: center; margin-bottom: 20px; }
+        button { background: #3b82f6; color: white; border: none; padding: 15px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.1s; user-select: none; }
+        button:hover { background: #2563eb; }
+        button:active { transform: scale(0.90); background: #1d4ed8; }
+        .empty { visibility: hidden; }
+        .action-btns { display: flex; gap: 10px; justify-content: center; }
+        .action-btns button { background: #10b981; flex: 1; }
+        .action-btns button.drop { background: #ef4444; }
+        pre { background: #000; padding: 10px; border-radius: 6px; font-size: 13px; overflow-x: auto; color: #00ff00; height: 80px; }
+        #req-log { color: #38bdf8; height: 70px; }
+        img.visor { width: 100%; max-width: 400px; border-radius: 8px; border: 2px solid #333; margin-bottom: 10px; }
+        .active-key { background: #1d4ed8 !important; transform: scale(0.95); }
+    </style>
+</head>
+<body>
+
+    <!-- Camera & Telemetry -->
+    <div class="panel" style="width: 400px;">
+        <h3>Visor Camera <span id="cam-status" style="font-size:12px; color: #10b981;">(Local Sim)</span></h3>
+        <!-- Loads directly from your own local simulation server -->
+        <img id="camera" class="visor" src="http://127.0.0.1:8080/look" alt="Robot Visor" onerror="this.alt='Camera Offline'">
+        
+        <h3>Live Telemetry</h3>
+        <pre id="telemetry">Ready...</pre>
+
+        <h3>Sharvesh Sync Log</h3>
+        <pre id="req-log">Connecting to Sharvesh...</pre>
+    </div>
+
+    <!-- Movement Controls -->
+    <div class="panel" style="width: 300px; text-align: center;">
+        <h3>Navigation (WASD)</h3>
+        <div class="controls">
+            <div class="empty"></div>
+            <button id="btn-w" onmousedown="triggerStart('w')" onmouseup="triggerStop('w')" onmouseleave="triggerStop('w')">W</button>
+            <div class="empty"></div>
+            <button id="btn-a" onmousedown="triggerStart('a')" onmouseup="triggerStop('a')" onmouseleave="triggerStop('a')">A</button>
+            <button id="btn-s" onmousedown="triggerStart('s')" onmouseup="triggerStop('s')" onmouseleave="triggerStop('s')">S</button>
+            <button id="btn-d" onmousedown="triggerStart('d')" onmouseup="triggerStop('d')" onmouseleave="triggerStop('d')">D</button>
+        </div>
+
+        <h3>Manipulators</h3>
+        <div class="action-btns">
+            <button onclick="api('/pickup', {})">Grab</button>
+            <button class="drop" onclick="api('/drop', {})">Drop</button>
+        </div>
+    </div>
+
+    <script>
+        const LOCAL_URL = "http://127.0.0.1:8080";
+        const SHARVESH_URL = "http://10.121.224.93:8080";
+        let activeKey = null;
+
+        function logSync(text) {
+            const logBox = document.getElementById('req-log');
+            if (logBox) {
+                logBox.innerText = text + "\n" + logBox.innerText.split('\n').slice(0, 2).join('\n');
+            }
+        }
+
+        // Standard API call to your local simulation backend
+        async function api(endpoint, payload = {}) {
+            try {
+                const res = await fetch(LOCAL_URL + endpoint, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+                return await res.json();
+            } catch (err) {
+                console.error("Local API Error:", err);
+            }
+        }
+
+        // Outbound sync ping sent straight to Sharvesh's server
+        async function notifySharveshRenderComplete() {
+            try {
+                const res = await fetch(SHARVESH_URL + "/engine/render_complete", { 
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" }
+                });
+                const data = await res.json();
+                logSync(`Synced to Sharvesh: ${data.status || 'ok'}`);
+            } catch (err) {
+                logSync(`Sharvesh unreachable`);
+            }
+        }
+
+        // --- Movement Loop ---
+        async function movementLoop(key) {
+            while (activeKey === key) {
+                if (key === 'w') await api('/move', { distance: 1.0 });
+                if (key === 's') await api('/move', { distance: -1.0 });
+                // Engine heading is clockwise-positive: +degrees turns RIGHT.
+                if (key === 'a') await api('/turn', { degrees: -30.0 });
+                if (key === 'd') await api('/turn', { degrees: 30.0 });
+                
+                // Beam render complete signal to Sharvesh after movement batch finishes
+                await notifySharveshRenderComplete();
+            }
+        }
+
+        function triggerStart(key) {
+            if (activeKey === key) return;
+            activeKey = key;
+            const btn = document.getElementById(`btn-${key}`);
+            if(btn) btn.classList.add('active-key');
+            movementLoop(key);
+        }
+
+        function triggerStop(key) {
+            if (activeKey === key) {
+                const btn = document.getElementById(`btn-${key}`);
+                if(btn) btn.classList.remove('active-key');
+                activeKey = null;
+            }
+        }
+
+        // --- Keyboard Bindings ---
+        window.addEventListener('keydown', (e) => {
+            if (e.repeat) return;
+            const key = e.key.toLowerCase();
+            if (['w', 'a', 's', 'd'].includes(key)) triggerStart(key);
+        });
+
+        window.addEventListener('keyup', (e) => {
+            triggerStop(e.key.toLowerCase());
+        });
+
+        // --- Local Polling & Sharvesh Sync Hooks ---
+        setInterval(async () => {
+            if (activeKey) return;
+            try {
+                const res = await fetch(LOCAL_URL + "/state");
+                const data = await res.json();
+                document.getElementById('telemetry').innerText = JSON.stringify(data, null, 2);
+                const sync = await (await fetch(LOCAL_URL + "/sync_status")).json();
+                logSync(sync.enabled
+                    ? `Heading sync: remote ${sync.last_remote_heading ?? '?'}° / robot ${sync.local_heading}°` +
+                      ` · ${sync.applied_turns} turns${sync.last_error ? ' · ERR ' + sync.last_error : ''}`
+                    : 'Heading sync off');
+            } catch (err) {}
+        }, 1000);
+
+        // Local Camera refresh + sync handshake to Sharvesh
+        setInterval(async () => {
+            if (activeKey) return;
+            const cam = document.getElementById('camera');
+            cam.src = LOCAL_URL + "/look?t=" + new Date().getTime();
+            
+            // Notify Sharvesh's server that a frame rendered locally
+            await notifySharveshRenderComplete();
+        }, 500);
+
+    </script>
+</body>
+</html>

@@ -1,86 +1,155 @@
-# sim/referee.py
+"""
+sim/referee.py — the run state machine and the task rules.
+
+States (brief, section 01):
+    Idle -> Locate -> GoToObject -> PickUp -> Carry -> Drop -> Done
+    Blocked: entered on any collision; the next command leaves it.
+             After MAX_RETRIES collisions the run fails (Done / fail_collision).
+
+The engine cannot know *which* object Claude is aiming for, so the
+navigation states are inferred from what the robot is doing:
+    /look or /turn while empty-handed  -> Locate
+    /move while empty-handed           -> GoToObject
+    any motion while holding           -> Carry
+Animations call begin_*/end_* so /state reports PickUp / Drop *while* the
+arm animation is playing, then the settled state when it finishes.
+
+Done is terminal until /reset: later commands still move the robot (so an
+agent never crashes) but the recorded outcome cannot be overwritten.
+
+Outcome codes: pass | fail_wrong_object | fail_not_reached | fail_collision.
+fail_wrong_object needs the command's intended target, which the engine never
+sees — it is judged from the logs / clip, so the referee never sets it.
+"""
+
 import math
-import pybullet as p
+import time
+
+
+class State:
+    IDLE = "Idle"
+    LOCATE = "Locate"
+    GO_TO_OBJECT = "GoToObject"
+    PICK_UP = "PickUp"
+    CARRY = "Carry"
+    DROP = "Drop"
+    DONE = "Done"
+    BLOCKED = "Blocked"
+
+
+class Outcome:
+    PASS = "pass"
+    FAIL_WRONG_OBJECT = "fail_wrong_object"
+    FAIL_NOT_REACHED = "fail_not_reached"
+    FAIL_COLLISION = "fail_collision"
+
+
+PICKUP_REACH_M = 0.5
+PICKUP_CONE_DEG = 30.0
+MAX_RETRIES = 3
+
+
+def angle_diff_deg(a, b):
+    """Smallest absolute difference between two headings, in degrees."""
+    return abs(((a - b + 180.0) % 360.0) - 180.0)
+
+
+def bearing_cw_deg(from_xy, to_xy):
+    """Bearing from one point to another in the clockwise-positive convention."""
+    return (-math.degrees(math.atan2(to_xy[1] - from_xy[1], to_xy[0] - from_xy[0]))) % 360.0
+
+
+def within_pickup_reach(robot_xy, heading_deg, obj_xy, reach=PICKUP_REACH_M, cone=PICKUP_CONE_DEG):
+    """Returns (ok, distance). Brief: reach 0.5 m and within +-30° of heading."""
+    dist = math.hypot(obj_xy[0] - robot_xy[0], obj_xy[1] - robot_xy[1])
+    if dist > reach:
+        return False, dist
+    return angle_diff_deg(bearing_cw_deg(robot_xy, obj_xy), heading_deg) <= cone, dist
+
+
+def in_drop_zone(obj_xy, zone_xy, half):
+    return abs(obj_xy[0] - zone_xy[0]) <= half and abs(obj_xy[1] - zone_xy[1]) <= half
 
 
 class Referee:
-    def __init__(self, engine):
-        self.engine = engine
-        self.state_name = "Idle"
+    def __init__(self, max_retries=MAX_RETRIES, history=500):
+        self.max_retries = max_retries
+        self._history = history
+        self.reset()
 
-    def pickup_object(self) -> dict:
-        """Picks up the object directly in FRONT of the robot's heading field of view."""
-        if getattr(self.engine, "held_object_id", None) is not None:
-            return {"status": "error", "message": "Already holding an object"}
+    # -- lifecycle -------------------------------------------------------
+    def reset(self):
+        self.state = State.IDLE
+        self.retries = 0
+        self.collided = False
+        self.outcome = None
+        self.events = []
+        self._log("reset", State.IDLE)
 
-        rx, ry, _ = self.engine.robot_pos
-        heading_rad = math.radians(self.engine.robot_heading)
+    @property
+    def terminal(self):
+        return self.state == State.DONE
 
-        target_obj = None
-        min_front_dist = 0.65  # Max reach forward
+    def _log(self, reason, new_state):
+        self.events.append({"t": round(time.time(), 3), "from": getattr(self, "state", None),
+                            "to": new_state, "reason": reason})
+        if len(self.events) > self._history:
+            del self.events[: len(self.events) - self._history]
 
-        for obj_id in self.engine.scene.object_ids:
-            pos, _ = p.getBasePositionAndOrientation(obj_id)
-            dx = pos[0] - rx
-            dy = pos[1] - ry
-            dist = math.hypot(dx, dy)
+    def _go(self, new_state, reason):
+        if self.terminal:
+            return
+        if new_state != self.state:
+            self._log(reason, new_state)
+        self.state = new_state
 
-            # Check angle relative to robot heading
-            obj_angle = math.degrees(math.atan2(dy, dx))
-            angle_diff = (obj_angle - self.engine.robot_heading + 180) % 360 - 180
+    # -- command hooks ---------------------------------------------------
+    def on_look(self, holding):
+        if self.state == State.IDLE:
+            self._go(State.CARRY if holding else State.LOCATE, "look")
 
-            # MUST be in front cone (within 35 degrees of front heading) and within reach
-            if abs(angle_diff) <= 35.0 and dist < min_front_dist:
-                min_front_dist = dist
-                target_obj = obj_id
+    def begin_move(self, holding):
+        self.collided = False
+        self._go(State.CARRY if holding else State.GO_TO_OBJECT, "move")
 
-        if target_obj is None:
-            return {"status": "failed", "message": "No object directly in front to pick up"}
+    def begin_turn(self, holding):
+        self.collided = False
+        self._go(State.CARRY if holding else State.LOCATE, "turn")
 
-        # Position object cleanly attached to front bumper
-        front_x = rx + 0.35 * math.cos(heading_rad)
-        front_y = ry + 0.35 * math.sin(heading_rad)
+    def on_collision(self):
+        self.collided = True
+        if self.terminal:
+            return
+        self.retries += 1
+        if self.retries > self.max_retries:
+            self.outcome = Outcome.FAIL_COLLISION
+            self._go(State.DONE, "collision retries exhausted")
+        else:
+            self._go(State.BLOCKED, "collision")
 
-        p.resetBasePositionAndOrientation(
-            target_obj,
-            [front_x, front_y, 0.25],
-            [0, 0, 0, 1],
-        )
+    def begin_pickup(self):
+        self._go(State.PICK_UP, "pickup")
 
-        # Attach object dynamically to robot using PyBullet joint constraint
-        constraint_id = p.createConstraint(
-            parentBodyUniqueId=self.engine.robot_id,
-            parentLinkIndex=-1,
-            childBodyUniqueId=target_obj,
-            childLinkIndex=-1,
-            jointType=p.JOINT_FIXED,
-            jointAxis=[0, 0, 0],
-            parentFramePosition=[0.35, 0, 0.1],
-            childFramePosition=[0, 0, 0],
-        )
+    def end_pickup(self, ok):
+        self._go(State.CARRY if ok else State.LOCATE, "pickup ok" if ok else "pickup missed")
 
-        self.engine.held_object_id = target_obj
-        self.engine.held_constraint_id = constraint_id
-        self.state_name = "Carrying"
+    def begin_drop(self):
+        self._go(State.DROP, "drop")
 
-        return {"status": "success", "picked_up_id": target_obj}
+    def end_drop(self, landed_in_zone):
+        if landed_in_zone:
+            if not self.terminal:
+                self.outcome = Outcome.PASS
+            self._go(State.DONE, "delivered to zone")
+        else:
+            self._go(State.LOCATE, "dropped outside zone")
 
-    def drop_object(self) -> dict:
-        """Releases the held object constraint so it drops cleanly onto the ground."""
-        if getattr(self.engine, "held_object_id", None) is None:
-            return {"status": "error", "message": "Not holding any object"}
+    def give_up(self):
+        """For an agent / harness that stops before delivering."""
+        if not self.terminal:
+            self.outcome = Outcome.FAIL_NOT_REACHED
+            self._go(State.DONE, "gave up")
 
-        if (
-            hasattr(self.engine, "held_constraint_id")
-            and self.engine.held_constraint_id is not None
-        ):
-            p.removeConstraint(self.engine.held_constraint_id)
-            self.engine.held_constraint_id = None
-
-        self.engine.held_object_id = None
-        self.state_name = "Idle"
-        return {"status": "success", "message": "Object dropped"}
-
-
-# Alias for backward compatibility
-RefereeManager = Referee
+    def summary(self):
+        return {"state": self.state, "retries": self.retries, "outcome": self.outcome,
+                "collided": self.collided}

@@ -1,4 +1,4 @@
-# PyBullet + Claude Vision Fetch Robot (`feature/roshni`)
+# PyBullet + Claude Vision Fetch Robot (`pybullet-claude-sim`)
 
 An interactive 3D robotics simulation built with **PyBullet**, **FastAPI**, and **Anthropic Claude Vision** (`agent2.py`). A wheeled humanoid robot perceives the arena exclusively through its forward visor camera (with HUD bearing/floor-distance scales), a single center depth ray, and physical contact sensors to locate, pick up, and deliver objects into the target drop zone.
 
@@ -14,10 +14,10 @@ An interactive 3D robotics simulation built with **PyBullet**, **FastAPI**, and 
 
 ## 1. Clone & Set Up the Environment
 
-Clone the repository and switch to the `feature/roshni` branch:
+Clone the repository and switch to the `pybullet-claude-sim` branch:
 
 ```cmd
-git clone -b feature/roshni https://github.com/Roshni-07/HackOween_Codejuring.git
+git clone -b pybullet-claude-sim https://github.com/Roshni-07/HackOween_Codejuring.git
 cd HackOween_Codejuring
 ```
 

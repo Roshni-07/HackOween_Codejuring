@@ -27,7 +27,7 @@
     <div class="panel" style="width: 400px;">
         <h3>Visor Camera <span id="cam-status" style="font-size:12px; color: #10b981;">(Local Sim)</span></h3>
         <!-- Loads directly from your own local simulation server -->
-        <img id="camera" class="visor" src="http://127.0.0.1:8080/look" alt="Robot Visor" onerror="this.alt='Camera Offline'">
+        <img id="camera" class="visor" src="http://127.0.0.1:8000/look" alt="Robot Visor" onerror="this.alt='Camera Offline'">
         
         <h3>Live Telemetry</h3>
         <pre id="telemetry">Ready...</pre>
@@ -56,8 +56,8 @@
     </div>
 
     <script>
-        const LOCAL_URL = "http://127.0.0.1:8080";
-        const SHARVESH_URL = "http://10.121.224.93:8080";
+        const LOCAL_URL = "http://127.0.0.1:8000";
+        const SHARVESH_URL = "http://127.0.0.1:8000";
         let activeKey = null;
 
         function logSync(text) {

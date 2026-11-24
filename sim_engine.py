@@ -1,459 +1,552 @@
-import io
+"""
+sim_engine.py — SimulationEngine: the facade server.py talks to.
+
+Composes the sim/ package:
+    sim.scene     arena, humanoid URDF, fetch objects, drop zone, obstacle
+    sim.driver    kinematic base + eased joint animation
+    sim.sensors   /look camera and /depth ray
+    sim.referee   state machine and task rules
+
+Conventions
+    * heading in degrees, clockwise-positive: forward = (cos h, -sin h).
+      turn_robot(+90) turns RIGHT.
+    * robot_pos = [x, y, 0.0] (base origin on the floor between the wheels).
+    * One re-entrant lock around every public call, because uvicorn runs sync
+      endpoints in a thread pool and the remote heading sync runs in its own
+      thread. PyBullet is not safe to drive from two threads at once.
+"""
+
+import functools
 import math
 import random
-import time
-import numpy as np
+import threading
+
 import pybullet as p
-import pybullet_data
-from PIL import Image
+
+from sim import scene
+from sim.driver import (
+    HEAD_NEUTRAL,
+    NEUTRAL_POSE,
+    REST_ARMS,
+    TUCKED_FREE_ARM,
+    HumanoidDriver,
+    arm_side_to,
+    arms_to,
+    lerp,
+    smootherstep,
+)
+from sim.referee import Referee, in_drop_zone, within_pickup_reach
+from sim.sensors import DepthSensor, RobotCamera, heading_vector
+
+MOVE_SPEED_MPS = 1.0
+TURN_SPEED_DPS = 90.0
+BACKOFF_M = 0.05
+COLLISION_TOL_M = 0.001          # penetration deeper than this counts as contact
+CARRY_LOCAL_XY = (0.14, -0.40)   # right hip: outside the camera's 45° half-FOV
+DROP_AHEAD_M = 0.42
+SPAWN_WALL_MARGIN = 0.25
+SPAWN_ROBOT_CLEAR = 0.35
+SPAWN_GAP = 0.30
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
+def _wrap_deg(a):
+    return a % 360.0
 
 
 class SimulationEngine:
+    def __init__(self, gui=True, realtime=None, collision_nudge_deg=0.0):
+        self.gui = bool(gui)
+        self.lock = threading.RLock()
+        self.collision_nudge_deg = float(collision_nudge_deg or 0.0)
 
-    def __init__(self, gui=True):
-        mode = p.GUI if gui else p.DIRECT
-        self.physics_client = p.connect(mode)
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        if self.gui:
+            self.client_id = p.connect(p.GUI, options=scene.GUI_CONNECT_OPTIONS)
+        else:
+            self.client_id = p.connect(p.DIRECT)
         p.setGravity(0, 0, -9.81)
+        p.setTimeStep(1.0 / 240.0)
+        if self.gui:
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+            for flag in ("COV_ENABLE_GUI", "COV_ENABLE_SEGMENTATION_MARK_PREVIEW",
+                         "COV_ENABLE_DEPTH_BUFFER_PREVIEW", "COV_ENABLE_RGB_BUFFER_PREVIEW"):
+                if hasattr(p, flag):
+                    p.configureDebugVisualizer(getattr(p, flag), 0)
 
-        self.room_size = 5.0
-        self.robot_pos = [0.0, 0.0, 0.25]
-        self.robot_heading = 0.0  # Degrees (0 = facing +X, positive = clockwise/right)
-        self.state_name = "Idle"
-        self.held_object_id = None
-        self.pickup_constraint = None
-        self.collided = False
-        self.retries = 0
-        self.debug_lines = []
+        # --- world -------------------------------------------------------
+        arena = scene.build_arena()
+        self.floor_id = arena["floor"]
+        self.wall_ids = list(arena["walls"])
+        self.drop_zone_pos = list(scene.DROP_ZONE_POS)
+        self.drop_zone_half = scene.DROP_ZONE_HALF
+        self.drop_zone_id = scene.build_drop_zone(self.drop_zone_pos)
+        self.obstacle_id = None
 
-        if gui:
-            p.resetDebugVisualizerCamera(
-                cameraDistance=4.8,
-                cameraYaw=45,
-                cameraPitch=-45,
-                cameraTargetPosition=[0, 0, 0],
-            )
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-            p.configureDebugVisualizer(
-                p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0
-            )
-            p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
-            p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
+        created = scene.spawn_objects()
+        self.object_ids = [body for body, _ in created]
+        self._specs = {body: spec for body, spec in created}
 
-        self._build_room()
-        self._spawn_shapes_and_dropzone()
-        self._create_robot()
-        self.update_debug_visuals()
+        self.robot_id = scene.load_humanoid(0.0, 0.0, 0.0)
+        self._robot_com = tuple(p.getDynamicsInfo(self.robot_id, -1)[3])
 
-    def _build_room(self):
-        """Build floor plane and 4 surrounding arena walls."""
-        p.loadURDF("plane.urdf")
-        wall_height, wall_thick = 1.0, 0.1
-        half_r = self.room_size / 2.0
+        # --- subsystems --------------------------------------------------
+        live = self.gui if realtime is None else bool(realtime)
+        self.driver = HumanoidDriver(self.robot_id, realtime=live)
+        self.camera = RobotCamera()
+        self.depth_sensor = DepthSensor(self._depth_ignored_bodies)
+        self.referee = Referee()
 
-        walls = [
-            [0, half_r, half_r, wall_thick],
-            [0, -half_r, half_r, wall_thick],
-            [half_r, 0, wall_thick, half_r],
-            [-half_r, 0, wall_thick, half_r],
-        ]
-        for wx, wy, hx, hy in walls:
-            shape = p.createCollisionShape(
-                p.GEOM_BOX, halfExtents=[hx, hy, wall_height / 2.0]
-            )
-            vis = p.createVisualShape(
-                p.GEOM_BOX,
-                halfExtents=[hx, hy, wall_height / 2.0],
-                rgbaColor=[0.7, 0.7, 0.7, 1],
-            )
-            p.createMultiBody(
-                0, shape, vis, basePosition=[wx, wy, wall_height / 2.0]
-            )
-
-    def _spawn_shapes_and_dropzone(self):
-        """Spawn green drop zone platform and primitive objects."""
-        self.drop_zone_pos = [1.8, 1.8, 0.005]
-        drop_vis = p.createVisualShape(
-            p.GEOM_BOX,
-            halfExtents=[0.4, 0.4, 0.005],
-            rgbaColor=[0.0, 0.8, 0.2, 0.6],
-        )
-        self.drop_zone_id = p.createMultiBody(
-            0, -1, drop_vis, basePosition=self.drop_zone_pos
-        )
-
-        objects_config = [
-            {
-                "type": p.GEOM_BOX,
-                "size": [0.15, 0.15, 0.15],
-                "color": [0.9, 0.1, 0.1, 1],
-                "pos": [1.5, 0.5, 0.15],
-            },  # Red Box
-            {
-                "type": p.GEOM_BOX,
-                "size": [0.15, 0.15, 0.15],
-                "color": [0.1, 0.3, 0.9, 1],
-                "pos": [1.0, -1.0, 0.15],
-            },  # Blue Box
-            {
-                "type": p.GEOM_SPHERE,
-                "radius": 0.15,
-                "color": [0.9, 0.1, 0.1, 1],
-                "pos": [1.8, -0.6, 0.15],
-            },  # Red Sphere
-            {
-                "type": p.GEOM_CYLINDER,
-                "radius": 0.12,
-                "length": 0.3,
-                "color": [0.9, 0.8, 0.0, 1],
-                "pos": [0.5, 1.5, 0.15],
-            },  # Yellow Cylinder
-            {
-                "type": p.GEOM_SPHERE,
-                "radius": 0.15,
-                "color": [0.6, 0.1, 0.8, 1],
-                "pos": [-1.2, 1.0, 0.15],
-            },  # Purple Sphere
-        ]
-
-        self.object_ids = []
-        for cfg in objects_config:
-            if cfg["type"] == p.GEOM_BOX:
-                col = p.createCollisionShape(
-                    p.GEOM_BOX, halfExtents=cfg["size"]
-                )
-                vis = p.createVisualShape(
-                    p.GEOM_BOX, halfExtents=cfg["size"], rgbaColor=cfg["color"]
-                )
-            elif cfg["type"] == p.GEOM_SPHERE:
-                col = p.createCollisionShape(
-                    p.GEOM_SPHERE, radius=cfg["radius"]
-                )
-                vis = p.createVisualShape(
-                    p.GEOM_SPHERE,
-                    radius=cfg["radius"],
-                    rgbaColor=cfg["color"],
-                )
-            elif cfg["type"] == p.GEOM_CYLINDER:
-                col = p.createCollisionShape(
-                    p.GEOM_CYLINDER, radius=cfg["radius"], height=cfg["length"]
-                )
-                vis = p.createVisualShape(
-                    p.GEOM_CYLINDER,
-                    radius=cfg["radius"],
-                    length=cfg["length"],
-                    rgbaColor=cfg["color"],
-                )
-
-            obj_id = p.createMultiBody(1.0, col, vis, basePosition=cfg["pos"])
-            self.object_ids.append(obj_id)
-
-        for obj_id in self.object_ids:
-            p.changeDynamics(
-                obj_id,
-                -1,
-                mass=1.0,
-                lateralFriction=0.8,
-                spinningFriction=0.1,
-                rollingFriction=0.1,
-                linearDamping=0.5,
-                angularDamping=0.5,
-            )
-
-        p.changeDynamics(0, -1, lateralFriction=1.0)
-
-    def _create_robot(self):
-        """Capsule robot base."""
-        col = p.createCollisionShape(p.GEOM_CAPSULE, radius=0.25, height=0.2)
-        vis = p.createVisualShape(
-            p.GEOM_CAPSULE, radius=0.25, length=0.2, rgbaColor=[0.2, 0.2, 0.2, 1]
-        )
-        self.robot_id = p.createMultiBody(
-            10.0, col, vis, basePosition=self.robot_pos
-        )
-
-    def get_camera_image(self):
-        """Render 640x480 JPEG (90 FOV, 0.5m height, 10 deg downward tilt)."""
-        rad = math.radians(self.robot_heading)
-        cam_height = 0.5
-        tilt_rad = math.radians(10)
-
-        dx = math.cos(rad)
-        dy = math.sin(rad)
-        dz = -math.tan(tilt_rad)
-
-        cam_pos = [self.robot_pos[0], self.robot_pos[1], cam_height]
-        cam_target = [cam_pos[0] + dx, cam_pos[1] + dy, cam_pos[2] + dz]
-        cam_up = [0, 0, 1]
-
-        view_matrix = p.computeViewMatrix(cam_pos, cam_target, cam_up)
-        proj_matrix = p.computeProjectionMatrixFOV(
-            fov=90, aspect=640 / 480, nearVal=0.1, farVal=10.0
-        )
-
-        _, _, rgb_img, _, _ = p.getCameraImage(
-            640,
-            480,
-            viewMatrix=view_matrix,
-            projectionMatrix=proj_matrix,
-            renderer=p.ER_TINY_RENDERER,
-        )
-
-        frame = np.reshape(rgb_img, (480, 640, 4))[:, :, :3]
-        img = Image.fromarray(frame.astype("uint8"), "RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90)
-        return buf.getvalue()
-
-    def get_single_depth(self, offset_r=0.26, max_dist=10.0):
-        """Returns raycast distance straight ahead without intersecting robot collision capsule (r=0.25m)."""
-        rad = math.radians(self.robot_heading)
-        tilt_rad = math.radians(10)
-
-        start_x = self.robot_pos[0] + offset_r * math.cos(rad)
-        start_y = self.robot_pos[1] + offset_r * math.sin(rad)
-        start_z = 0.5
-
-        end_x = start_x + max_dist * math.cos(rad)
-        end_y = start_y + max_dist * math.sin(rad)
-        end_z = start_z - max_dist * math.tan(tilt_rad)
-
-        ray_res = p.rayTest([start_x, start_y, start_z], [end_x, end_y, end_z])
-        hit_fraction = ray_res[0][2]
-
-        if hit_fraction < 1.0:
-            return round(float(hit_fraction * max_dist), 2)
-        return None
-
-    def get_depth_fan(self, angles=[-30, -15, 0, 15, 30], offset_r=0.26, max_dist=10.0):
-        """Returns array of depth ray distances across a fan angle."""
-        results = []
-        for angle in angles:
-            rad = math.radians(self.robot_heading + angle)
-            tilt_rad = math.radians(10)
-
-            start_x = self.robot_pos[0] + offset_r * math.cos(rad)
-            start_y = self.robot_pos[1] + offset_r * math.sin(rad)
-            start_z = 0.5
-
-            end_x = start_x + max_dist * math.cos(rad)
-            end_y = start_y + max_dist * math.sin(rad)
-            end_z = start_z - max_dist * math.tan(tilt_rad)
-
-            ray_res = p.rayTest([start_x, start_y, start_z], [end_x, end_y, end_z])
-            hit_frac = ray_res[0][2]
-            dist = round(float(hit_frac * max_dist), 2) if hit_frac < 1.0 else None
-            results.append({"angle_offset": angle, "distance": dist})
-        return results
-
-    def update_debug_visuals(self):
-        """Draw 3D FOV frustum lines and pickup radius in PyBullet GUI."""
-        for line_id in self.debug_lines:
-            p.removeUserDebugItem(line_id)
-        self.debug_lines.clear()
-
-        rx, ry = self.robot_pos[0], self.robot_pos[1]
-
-        # 1. Draw 0.5m pickup sector lines (+-30 deg) in RED
-        for angle_offset in [-30, 30]:
-            cone_rad = math.radians(self.robot_heading + angle_offset)
-            ex = rx + 0.5 * math.cos(cone_rad)
-            ey = ry + 0.5 * math.sin(cone_rad)
-            line_id = p.addUserDebugLine(
-                [rx, ry, 0.25], [ex, ey, 0.25], [1, 0, 0], lineWidth=2
-            )
-            self.debug_lines.append(line_id)
-
-        # 2. Draw 90 deg Camera FOV cone in CYAN
-        for angle_offset in [-45, 45]:
-            fov_rad = math.radians(self.robot_heading + angle_offset)
-            ex = rx + 2.0 * math.cos(fov_rad)
-            ey = ry + 2.0 * math.sin(fov_rad)
-            line_id = p.addUserDebugLine(
-                [rx, ry, 0.5], [ex, ey, 0.1], [0, 1, 1], lineWidth=1
-            )
-            self.debug_lines.append(line_id)
-
-    def check_physical_collisions(self):
-        """Detect real physical mesh contacts against walls, obstacles, or floor items."""
-        contacts = p.getContactPoints(bodyA=self.robot_id)
-        for c in contacts:
-            touching_body = c[2]
-            if touching_body != 0 and touching_body != self.held_object_id:
-                return True
-        return False
-
-    def move_robot(self, distance):
-        """Move robot using interpolated sub-stepping, collision detection, 0.1m recoil, and 15 deg rotational nudge."""
-        rad = math.radians(self.robot_heading)
-        num_steps = 15
-        step_dist = distance / num_steps
-
-        for _ in range(num_steps):
-            target_x = self.robot_pos[0] + step_dist * math.cos(rad)
-            target_y = self.robot_pos[1] + step_dist * math.sin(rad)
-
-            if abs(target_x) > 2.25 or abs(target_y) > 2.25 or self.check_physical_collisions():
-                self.collided = True
-                self.state_name = "Blocked"
-                self.retries += 1
-                
-                # Apply 0.1m recoil away from impact
-                self.robot_pos[0] -= 0.1 * math.cos(rad)
-                self.robot_pos[1] -= 0.1 * math.sin(rad)
-                p.resetBasePositionAndOrientation(
-                    self.robot_id, self.robot_pos, [0, 0, 0, 1]
-                )
-                
-                # Rotational nudge (+15 deg) to prevent corner trapping loops
-                self.turn_robot(15.0)
-                self.update_debug_visuals()
-                return {"moved": round(distance * 0.5, 2), "collided": True}
-
-            self.robot_pos[0] = target_x
-            self.robot_pos[1] = target_y
-            p.resetBasePositionAndOrientation(
-                self.robot_id, self.robot_pos, [0, 0, 0, 1]
-            )
-            p.stepSimulation()
-
-        self.collided = False
-        self.update_debug_visuals()
-        return {"moved": round(distance, 2), "collided": False}
-
-    def turn_robot(self, degrees):
-        """Turn robot in place (positive degrees = right / clockwise)."""
-        self.robot_heading = (self.robot_heading + degrees) % 360
-        rad = math.radians(self.robot_heading)
-        orn = p.getQuaternionFromEuler([0, 0, -rad])
-        p.resetBasePositionAndOrientation(self.robot_id, self.robot_pos, orn)
-        self.update_debug_visuals()
-        return {"heading": round(self.robot_heading, 1)}
-
-    def pickup_object(self):
-        """Attach nearest object within 0.5m and +-30 deg using a rigid PyBullet constraint."""
-        if self.held_object_id:
-            return {"ok": False}
-
-        rx, ry = self.robot_pos[0], self.robot_pos[1]
-        for obj_id in self.object_ids:
-            pos, _ = p.getBasePositionAndOrientation(obj_id)
-            dist = math.hypot(pos[0] - rx, pos[1] - ry)
-
-            angle_to_obj = math.degrees(math.atan2(pos[1] - ry, pos[0] - rx))
-            heading_diff = abs(((angle_to_obj - self.robot_heading + 180) % 360) - 180)
-
-            if dist <= 0.5 and heading_diff <= 30:
-                self.held_object_id = obj_id
-                self.state_name = "Carry"
-
-                self.pickup_constraint = p.createConstraint(
-                    parentBodyUniqueId=self.robot_id,
-                    parentLinkIndex=-1,
-                    childBodyUniqueId=obj_id,
-                    childLinkIndex=-1,
-                    jointType=p.JOINT_FIXED,
-                    jointAxis=[0, 0, 0],
-                    parentFramePosition=[0.35, 0, 0.1],
-                    childFramePosition=[0, 0, 0],
-                )
-                return {"ok": True}
-
-        return {"ok": False}
-
-    def drop_object(self):
-        """Release fixed physics constraint and check drop zone placement."""
-        if not self.held_object_id:
-            return {"ok": False, "in_zone": False}
-
-        if hasattr(self, "pickup_constraint") and self.pickup_constraint is not None:
-            p.removeConstraint(self.pickup_constraint)
-            self.pickup_constraint = None
-
-        pos, _ = p.getBasePositionAndOrientation(self.held_object_id)
-        dx = abs(pos[0] - self.drop_zone_pos[0])
-        dy = abs(pos[1] - self.drop_zone_pos[1])
-
-        in_drop_zone = dx <= 0.4 and dy <= 0.4
-        self.held_object_id = None
-        self.state_name = "Done" if in_drop_zone else "Carry"
-        return {"ok": True, "in_zone": in_drop_zone}
-
-    def reset_scene(self, seed=None):
-        """Resets robot state and scrambles object locations with 1.0m origin clearance."""
-        if seed is not None:
-            random.seed(seed)
-
-        if hasattr(self, "pickup_constraint") and self.pickup_constraint is not None:
-            p.removeConstraint(self.pickup_constraint)
-            self.pickup_constraint = None
-
-        placed_positions = []
-
-        for obj_id in self.object_ids:
-            valid_pos = False
-            while not valid_pos:
-                rx = round(random.uniform(-1.8, 1.8), 2)
-                ry = round(random.uniform(-1.8, 1.8), 2)
-
-                dist_to_origin = math.hypot(rx, ry)
-                dist_to_drop = math.hypot(
-                    rx - self.drop_zone_pos[0], ry - self.drop_zone_pos[1]
-                )
-                dist_to_others = [
-                    math.hypot(rx - px, ry - py) for px, py in placed_positions
-                ]
-
-                if (
-                    dist_to_origin >= 1.0
-                    and dist_to_drop > 0.8
-                    and all(d >= 0.6 for d in dist_to_others)
-                ):
-                    valid_pos = True
-                    placed_positions.append([rx, ry])
-                    p.resetBasePositionAndOrientation(
-                        obj_id, [rx, ry, 0.15], [0, 0, 0, 1]
-                    )
-
-        self.robot_pos = [0.0, 0.0, 0.25]
+        # --- robot state -------------------------------------------------
+        self.robot_pos = [0.0, 0.0, 0.0]
         self.robot_heading = 0.0
         self.held_object_id = None
-        self.state_name = "Idle"
-        self.collided = False
-        self.retries = 0
-        p.resetBasePositionAndOrientation(
-            self.robot_id, self.robot_pos, [0, 0, 0, 1]
+        self.pickup_constraint = None
+        self._carry_local = None          # (lx, ly, z) while holding
+        self._set_pose(0.0, 0.0, 0.0)
+
+        if self.gui:
+            scene.configure_gui_lighting()
+            p.resetDebugVisualizerCamera(cameraDistance=4.6, cameraYaw=45, cameraPitch=-42,
+                                         cameraTargetPosition=[0.3, 0.3, 0.0])
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
+
+    # ------------------------------------------------------------------
+    # Read-only views used by server.py / tests
+    # ------------------------------------------------------------------
+    @property
+    def state_name(self):
+        return self.referee.state
+
+    @property
+    def retries(self):
+        return self.referee.retries
+
+    @property
+    def collided(self):
+        return self.referee.collided
+
+    @property
+    def holding(self):
+        return self.held_object_id is not None
+
+    @_locked
+    def get_state(self):
+        """Snapshot in the /state schema."""
+        return {
+            "name": self.state_name,
+            "x": round(self.robot_pos[0], 3),
+            "y": round(self.robot_pos[1], 3),
+            "heading": round(self.robot_heading, 1),
+            "holding": self.holding,
+            "retries": self.retries,
+        }
+
+    # ------------------------------------------------------------------
+    # Frames and pose helpers
+    # ------------------------------------------------------------------
+    def _forward(self, heading=None):
+        return heading_vector(self.robot_heading if heading is None else heading)
+
+    def _left(self, heading=None):
+        h = math.radians(self.robot_heading if heading is None else heading)
+        return math.sin(h), math.cos(h)
+
+    def _to_local(self, xyz):
+        """World point -> (forward, left, z) in the robot frame."""
+        dx, dy = xyz[0] - self.robot_pos[0], xyz[1] - self.robot_pos[1]
+        fx, fy = self._forward()
+        lx, ly = self._left()
+        return (dx * fx + dy * fy, dx * lx + dy * ly, xyz[2])
+
+    def _from_local(self, fwd, left, z, x=None, y=None, heading=None):
+        x = self.robot_pos[0] if x is None else x
+        y = self.robot_pos[1] if y is None else y
+        fx, fy = self._forward(heading)
+        lx, ly = self._left(heading)
+        return (x + fwd * fx + left * lx, y + fwd * fy + left * ly, z)
+
+    def _object_quat(self, heading=None):
+        h = self.robot_heading if heading is None else heading
+        return p.getQuaternionFromEuler([0.0, 0.0, -math.radians(h)])
+
+    def _put_object(self, body, xyz, quat=None):
+        p.resetBasePositionAndOrientation(body, list(xyz), list(quat or (0.0, 0.0, 0.0, 1.0)))
+        p.resetBaseVelocity(body, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+
+    def _set_pose(self, x, y, heading):
+        """Place the robot base (and anything it carries). No animation."""
+        self.robot_pos = [float(x), float(y), 0.0]
+        self.robot_heading = _wrap_deg(float(heading))
+        self.driver.set_base(self.robot_pos[0], self.robot_pos[1], self.robot_heading)
+        if self.held_object_id is not None and self._carry_local is not None:
+            self._put_object(self.held_object_id, self._from_local(*self._carry_local), self._object_quat())
+
+    @_locked
+    def _place_robot(self, x, y, heading):
+        """Test/setup helper: teleport without animation or referee changes."""
+        self._set_pose(x, y, heading)
+
+    # ------------------------------------------------------------------
+    # Collision
+    # ------------------------------------------------------------------
+    def _collidable_bodies(self):
+        bodies = list(self.wall_ids) + [b for b in self.object_ids if b != self.held_object_id]
+        if self.obstacle_id is not None:
+            bodies.append(self.obstacle_id)
+        return bodies
+
+    def _penetration(self):
+        """Deepest overlap (metres, >= 0) between the torso (or held object) and the world."""
+        deepest = 0.0
+        sources = [self.robot_id]
+        if self.held_object_id is not None:
+            sources.append(self.held_object_id)
+        for src in sources:
+            for body in self._collidable_bodies():
+                for pt in p.getClosestPoints(bodyA=src, bodyB=body, distance=0.0, linkIndexA=-1):
+                    deepest = max(deepest, -pt[8])
+        return deepest
+
+    @_locked
+    def check_physical_collisions(self):
+        return self._penetration() > COLLISION_TOL_M
+
+    def _depth_ignored_bodies(self):
+        ignored = [self.robot_id]
+        if self.held_object_id is not None:
+            ignored.append(self.held_object_id)
+        return ignored
+
+    # ------------------------------------------------------------------
+    # Sensors
+    # ------------------------------------------------------------------
+    @_locked
+    def get_camera_image(self):
+        self.referee.on_look(self.holding)
+        return self.camera.get_camera_image(self.robot_pos[0], self.robot_pos[1], self.robot_heading)
+
+    @_locked
+    def get_single_depth(self):
+        return self.depth_sensor.get_depth_ray(self.robot_pos[0], self.robot_pos[1], self.robot_heading)
+
+    @_locked
+    def get_depth_fan(self):
+        return self.depth_sensor.get_depth_fan(self.robot_pos[0], self.robot_pos[1], self.robot_heading)
+
+    # ------------------------------------------------------------------
+    # Motion
+    # ------------------------------------------------------------------
+    def _animate_translate(self, distance, swing_arms):
+        """Eased straight-line move. Returns (net_distance, hit)."""
+        sx, sy, h = self.robot_pos[0], self.robot_pos[1], self.robot_heading
+        fx, fy = self._forward(h)
+        w0 = self.driver.wheel_angles()
+        rest = self.driver.current_pose(tuple(REST_ARMS))
+        start_pen = self._penetration()
+        cycles = max(1, int(round(abs(distance) / 0.35)))
+        state = {"safe": 0.0, "hit": False}
+
+        def update(s):
+            d = distance * smootherstep(s)
+            self._set_pose(sx + fx * d, sy + fy * d, h)
+            self.driver.roll_wheels(d, d, w0)
+            if swing_arms:
+                a = 0.35 * math.sin(2.0 * math.pi * cycles * s) * math.sin(math.pi * s)
+                self.driver.set_joint("left_shoulder_joint", rest["left_shoulder_joint"] + a)
+                self.driver.set_joint("right_shoulder_joint", rest["right_shoulder_joint"] - a)
+            pen = self._penetration()
+            # Contact counts only if it is new or getting deeper, so a robot
+            # that starts touching something can still drive away from it.
+            if pen > COLLISION_TOL_M and pen > start_pen + 1e-4:
+                state["hit"] = True
+                return False
+            state["safe"] = d
+            return None
+
+        self.driver.run(abs(distance) / MOVE_SPEED_MPS, update)
+        if state["hit"]:
+            d = state["safe"]
+            self._set_pose(sx + fx * d, sy + fy * d, h)
+            self.driver.roll_wheels(d, d, w0)
+        if swing_arms:
+            self.driver.apply(rest)
+        return state["safe"], state["hit"]
+
+    def _animate_turn(self, degrees):
+        h0 = self.robot_heading
+        delta = float(degrees)
+        w0 = self.driver.wheel_angles()
+        arc = math.radians(delta) * scene.ROBOT_GEOMETRY["half_track"]
+        sign = 1.0 if delta >= 0 else -1.0
+        lead = min(0.45, abs(math.radians(delta)) * 0.4)
+        head0 = self.driver.current_pose(("neck_joint", "head_joint"))
+
+        def update(s):
+            e = smootherstep(s)
+            self._set_pose(self.robot_pos[0], self.robot_pos[1], h0 + delta * e)
+            # Right (clockwise) turn: left wheel forward, right wheel back.
+            self.driver.roll_wheels(arc * e, -arc * e, w0)
+            bump = math.sin(math.pi * s)
+            self.driver.set_joint("neck_joint", lerp(head0["neck_joint"], 0.0, e) - sign * lead * bump)
+            self.driver.set_joint("head_joint", lerp(head0["head_joint"], 0.0, e) + 0.06 * bump)
+
+        self.driver.run(abs(delta) / TURN_SPEED_DPS, update)
+        self.driver.apply(HEAD_NEUTRAL)
+        self._set_pose(self.robot_pos[0], self.robot_pos[1], h0 + delta)
+
+    def _blocked_reaction(self, travel_sign):
+        """0.1 m back-off opposite the travel direction, head recoil, eyes flash."""
+        self.driver.set_eyes(True)
+        sx, sy, h = self.robot_pos[0], self.robot_pos[1], self.robot_heading
+        fx, fy = self._forward(h)
+        back = -travel_sign * BACKOFF_M
+        w0 = self.driver.wheel_angles()
+        state = {"safe": 0.0}
+        start_pen = self._penetration()
+
+        def update(s):
+            d = back * smootherstep(s)
+            self._set_pose(sx + fx * d, sy + fy * d, h)
+            self.driver.roll_wheels(d, d, w0)
+            self.driver.set_joint("head_joint", -0.25 * math.sin(math.pi * s))
+            pen = self._penetration()
+            if pen > COLLISION_TOL_M and pen > start_pen + 1e-4:
+                return False
+            state["safe"] = d
+            return None
+
+        self.driver.run(0.35, update, min_frames=10)
+        d = state["safe"]
+        self._set_pose(sx + fx * d, sy + fy * d, h)
+        self.driver.apply(HEAD_NEUTRAL)
+        self.driver.set_eyes(False)
+        return d
+
+    @_locked
+    def move_robot(self, distance):
+        distance = float(distance)
+        self.referee.begin_move(self.holding)
+        self.driver.recentre_head()
+        moved, hit = self._animate_translate(distance, swing_arms=not self.holding)
+        if not hit:
+            return {"moved": round(moved, 3), "collided": False}
+        self.referee.on_collision()
+        sign = 1.0 if distance >= 0 else -1.0
+        moved += self._blocked_reaction(sign)
+        if self.collision_nudge_deg:
+            self._animate_turn(self.collision_nudge_deg)
+        return {"moved": round(moved, 3), "collided": True}
+
+    @_locked
+    def turn_robot(self, degrees):
+        self.referee.begin_turn(self.holding)
+        self._animate_turn(degrees)
+        return {"heading": round(self.robot_heading, 1)}
+
+    @_locked
+    def turn_to_heading(self, target_deg):
+        """Animated turn the short way round to an absolute heading."""
+        delta = ((float(target_deg) - self.robot_heading + 180.0) % 360.0) - 180.0
+        if abs(delta) < 1e-6:
+            return {"heading": round(self.robot_heading, 1)}
+        return self.turn_robot(delta)
+
+    # ------------------------------------------------------------------
+    # Manipulation
+    # ------------------------------------------------------------------
+    def _carry_height(self, spec):
+        return max(0.24, scene.object_half_height(spec) + 0.10)
+
+    def _set_held_collisions(self, body, enabled):
+        if enabled:
+            p.setCollisionFilterGroupMask(body, -1, 1, -1)
+        else:
+            p.setCollisionFilterGroupMask(body, -1, 0, 0)
+
+    def _attach(self, body, local):
+        self.held_object_id = body
+        self._carry_local = local
+        self._set_held_collisions(body, False)
+        cx, cy, cz = self._robot_com
+        self.pickup_constraint = p.createConstraint(
+            parentBodyUniqueId=self.robot_id, parentLinkIndex=-1,
+            childBodyUniqueId=body, childLinkIndex=-1,
+            jointType=p.JOINT_FIXED, jointAxis=[0, 0, 0],
+            parentFramePosition=[local[0] - cx, local[1] - cy, local[2] - cz],
+            childFramePosition=[0, 0, 0],
         )
-        self.update_debug_visuals()
+        p.changeConstraint(self.pickup_constraint, maxForce=500)
+
+    def _release(self):
+        body = self.held_object_id
+        if self.pickup_constraint is not None:
+            p.removeConstraint(self.pickup_constraint)
+        self.pickup_constraint = None
+        self.held_object_id = None
+        self._carry_local = None
+        if body is not None:
+            self._set_held_collisions(body, True)
+        return body
+
+    @_locked
+    def pickup_object(self):
+        if self.held_object_id is not None:
+            return {"ok": False}
+        self.referee.begin_pickup()
+        self.driver.recentre_head()
+
+        rxy = (self.robot_pos[0], self.robot_pos[1])
+        best = None
+        for body in self.object_ids:
+            pos, _ = p.getBasePositionAndOrientation(body)
+            ok, dist = within_pickup_reach(rxy, self.robot_heading, (pos[0], pos[1]))
+            if ok and (best is None or dist < best[1]):
+                best = (body, dist, pos)
+
+        if best is None:
+            # Reach out, find nothing, come back.
+            self.driver.blend_to(dict(arms_to(0.32, 0.18), head_joint=0.30, neck_joint=0.0), 0.45)
+            self.driver.blend_to(NEUTRAL_POSE, 0.40)
+            self.referee.end_pickup(False)
+            return {"ok": False}
+
+        body, _, pos = best
+        spec = self._specs[body]
+        f0, l0, z0 = self._to_local(pos)
+        reach_z = max(0.10, pos[2])
+
+        # 1. reach: both arms toward the object, visor tilts down
+        self.driver.blend_to(dict(arms_to(min(f0, 0.33), reach_z), head_joint=0.30, neck_joint=0.0), 0.5)
+
+        # 2. lift and tuck under the right arm
+        target = (CARRY_LOCAL_XY[0], CARRY_LOCAL_XY[1], self._carry_height(spec))
+        quat = self._object_quat()
+        tuck = dict(arm_side_to("right", 0.16, 0.24), **TUCKED_FREE_ARM)
+        tuck.update(HEAD_NEUTRAL)
+
+        def carry_obj(s, e):
+            lift = smootherstep(min(1.0, s * 2.0))     # rise first, then slide to the hip
+            slide = smootherstep(max(0.0, s * 2.0 - 0.6) / 1.4)
+            z = lerp(z0, target[2], lift)
+            self._put_object(body, self._from_local(lerp(f0, target[0], slide), lerp(l0, target[1], slide), z), quat)
+
+        self.driver.blend_to(tuck, 0.7, extra=carry_obj, step_physics=False)
+        self._attach(body, target)
+        self._set_pose(self.robot_pos[0], self.robot_pos[1], self.robot_heading)
+        self.referee.end_pickup(True)
+        return {"ok": True}
+
+    @_locked
+    def drop_object(self):
+        if self.held_object_id is None:
+            return {"ok": False, "in_zone": False}
+        self.referee.begin_drop()
+        body = self.held_object_id
+        spec = self._specs[body]
+        hz = scene.object_half_height(spec)
+        sx, sy, sz = self._carry_local
+        quat = self._object_quat()
+
+        # 1. swing from the hip to straight ahead
+        def swing(s, e):
+            self._carry_local = (lerp(sx, DROP_AHEAD_M, e), lerp(sy, 0.0, e), sz)
+            self._put_object(body, self._from_local(*self._carry_local), quat)
+
+        self.driver.blend_to(arms_to(0.33, sz), 0.5, extra=swing, step_physics=False)
+
+        # 2. lower it to the floor
+        floor_z = hz + 0.001
+
+        def lower(s, e):
+            self._carry_local = (DROP_AHEAD_M, 0.0, lerp(sz, floor_z, e))
+            self._put_object(body, self._from_local(*self._carry_local), quat)
+
+        self.driver.blend_to(dict(arms_to(0.33, max(0.10, floor_z)), head_joint=0.25, neck_joint=0.0),
+                             0.5, extra=lower, step_physics=False)
+
+        # 3. release and retract
+        self._release()
+        self._put_object(body, self._from_local(DROP_AHEAD_M, 0.0, floor_z), quat)
+        self.driver.blend_to(NEUTRAL_POSE, 0.4)
+
+        pos, _ = p.getBasePositionAndOrientation(body)
+        landed = in_drop_zone((pos[0], pos[1]), self.drop_zone_pos, self.drop_zone_half)
+        self.referee.end_drop(landed)
+        return {"ok": True, "in_zone": bool(landed)}
+
+    # ------------------------------------------------------------------
+    # Scene control
+    # ------------------------------------------------------------------
+    def _spawn_ok(self, x, y, r, placed):
+        robot_r = scene.ROBOT_GEOMETRY["collision_radius"]
+        if math.hypot(x, y) < robot_r + r + SPAWN_ROBOT_CLEAR:
+            return False
+        # Keep the lane straight ahead of the start pose (heading 0 = +x) clear
+        # for the first 1 m, so the opening move can never hit an object.
+        if -0.3 < x < 1.0 + robot_r + r and abs(y) < robot_r + r + 0.1:
+            return False
+        zx, zy = self.drop_zone_pos[0], self.drop_zone_pos[1]
+        if max(abs(x - zx), abs(y - zy)) < self.drop_zone_half + r + 0.2:
+            return False
+        if self.obstacle_id is not None:
+            ox, oy, hx, hy = scene.OBSTACLE_FOOTPRINT
+            dx = max(0.0, abs(x - ox) - hx)
+            dy = max(0.0, abs(y - oy) - hy)
+            if math.hypot(dx, dy) < r + 0.15:
+                return False
+        return all(math.hypot(x - px, y - py) >= r + pr + SPAWN_GAP for px, py, pr in placed)
+
+    def _scatter_objects(self, rng):
+        placed = []
+        for body in self.object_ids:
+            spec = self._specs[body]
+            r = scene.object_footprint_radius(spec)
+            lim = scene.WALL_INNER - r - SPAWN_WALL_MARGIN
+            for _ in range(5000):
+                x, y = round(rng.uniform(-lim, lim), 2), round(rng.uniform(-lim, lim), 2)
+                if self._spawn_ok(x, y, r, placed):
+                    break
+            placed.append((x, y, r))
+            self._put_object(body, (x, y, scene.object_half_height(spec) + 0.001))
+
+    @_locked
+    def reset_scene(self, seed=None):
+        if self.held_object_id is not None:
+            self._release()
+        self._scatter_objects(random.Random(seed))
+        self.driver.set_eyes(False)
+        self.driver.apply(NEUTRAL_POSE)
+        self._set_pose(0.0, 0.0, 0.0)
+        self.referee.reset()
+        self.driver.scan()
         return {"status": "reset_complete"}
 
+    @_locked
     def enable_obstacle_mode(self):
-        """Spawns internal wall blocking direct path from origin to drop zone for stretch goal testing."""
-        wall_col = p.createCollisionShape(
-            p.GEOM_BOX, halfExtents=[0.1, 0.8, 0.5]
-        )
-        wall_vis = p.createVisualShape(
-            p.GEOM_BOX,
-            halfExtents=[0.1, 0.8, 0.5],
-            rgbaColor=[0.3, 0.3, 0.3, 1],
-        )
-        self.obstacle_id = p.createMultiBody(
-            0, wall_col, wall_vis, basePosition=[0.9, 0.9, 0.5]
-        )
+        if self.obstacle_id is None:
+            self.obstacle_id = scene.build_obstacle()
+            ox, oy, hx, hy = scene.OBSTACLE_FOOTPRINT
+            for body in self.object_ids:
+                pos, _ = p.getBasePositionAndOrientation(body)
+                r = scene.object_footprint_radius(self._specs[body])
+                if abs(pos[0] - ox) < hx + r + 0.15 and abs(pos[1] - oy) < hy + r + 0.15:
+                    self._scatter_objects(random.Random())
+                    break
         return {"obstacle_enabled": True}
 
+    @_locked
+    def give_up(self):
+        self.referee.give_up()
+        return self.referee.summary()
 
-if __name__ == "__main__":
-    engine = SimulationEngine(gui=True)
-    img_bytes = engine.get_camera_image()
-    with open("camera_preview.jpg", "wb") as f:
-        f.write(img_bytes)
-    print("Simulation engine running! Camera preview saved to camera_preview.jpg.")
-
-    try:
-        while p.isConnected(engine.physics_client):
-            p.stepSimulation()
-            time.sleep(1.0 / 60.0)
-    except KeyboardInterrupt:
-        print("Closing simulation.")
-        p.disconnect()
+    def close(self):
+        with self.lock:
+            if p.isConnected():
+                p.disconnect()

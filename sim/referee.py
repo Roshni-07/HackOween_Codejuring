@@ -44,7 +44,7 @@ class Outcome:
     FAIL_COLLISION = "fail_collision"
 
 
-PICKUP_REACH_M = 0.5
+PICKUP_REACH_M = 0.58
 PICKUP_CONE_DEG = 30.0
 MAX_RETRIES = 3
 

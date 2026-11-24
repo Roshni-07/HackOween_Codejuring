@@ -1,65 +1,114 @@
-# 🤖 Humanoid Robot Control API & Simulation Arena
+# PyBullet + Claude Vision Fetch Robot (`feature/roshni`)
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-005571?logo=fastapi)](https://fastapi.tiangolo.com/)
-[![PyBullet](https://img.shields.io/badge/PyBullet-3.25-orange.svg)](https://pybullet.org/)
-
-A distributed robotics backend and 3D simulation environment built for multi-agent coordination. This project couples a high-performance **FastAPI** control server with a **PyBullet** physics simulation engine (`sim_engine.py`) to manage humanoid robot kinematics, collision detection, sensor streams, and object manipulation tasks.
+An interactive 3D robotics simulation built with **PyBullet**, **FastAPI**, and **Anthropic Claude Vision** (`agent2.py`). A wheeled humanoid robot perceives the arena exclusively through its forward visor camera (with HUD bearing/floor-distance scales), a single center depth ray, and physical contact sensors to locate, pick up, and deliver objects into the target drop zone.
 
 ---
 
-## 🖼️ Visual Preview & Dashboard
+## Prerequisites
 
-### 1. 3D Simulation Arena (PyBullet Viewport)
-The environment features a custom-built arena complete with dynamic obstacles, target objects, and drop zones governed by PyBullet's 3D physics engine.
-![Simulation Arena](assets/simulation_arena.png)
-
-### 2. Control Dashboard & Live Telemetry
-Provides a real-time monitoring interface tracking live coordinates (`x`, `y`), robot heading, holding states, and integrated WASD navigation / manipulator controls.
-![Control Dashboard](assets/dashboard.png)
-
-### 3. FastAPI Interactive Documentation (Swagger UI)
-Cleanly structured REST endpoints for state telemetry, sensor depth arrays, velocity tracking, and actuator controls.
-![API Endpoints](assets/api_endpoints.png)
+- **OS:** Windows 10 / 11 (or macOS / Linux with equivalent shell commands)
+- **Python:** Python 3.11 (recommended for prebuilt `pybullet` wheel compatibility)
+- **API Key:** An active Anthropic API key (`sk-ant-...`)
 
 ---
 
-## 🛠️ Architecture & Tech Stack
-* **Backend & Routing:** Python, FastAPI, Uvicorn (Asynchronous REST API)
-* **Physics & Simulation:** PyBullet, OpenGL, NumPy (Rigid body dynamics, collision mapping, raycasting)
-* **Validation & Networking:** Pydantic (Strict request/response validation), Requests (Inter-node synchronization with peer servers)
-* **Modular Design:** Encapsulated packages for arena scenes (`sim/scene.py`), kinematics/drivers (`sim/driver.py`), referee scoring (`sim/referee.py`), and depth/vision sensors (`sim/sensors.py`).
+## 1. Clone & Set Up the Environment
 
----
+Clone the repository and switch to the `feature/roshni` branch:
 
-## 📡 Complete API Endpoints Reference
-
-### Telemetry & Vision
-* **`GET /state`** — Returns current robot telemetry (`name`, coordinates `x`, `y`, `heading`, `holding`, `collided`, `retries`).
-* **`GET /look`** — Captures a local PyBullet camera frame, forwards the base64 payload to peer nodes (e.g., Sharvesh's server), and returns a JPEG response.
-* **`GET /depth` & `GET /depth_fan`** — Returns single or fan-out distance ray data used for autonomous obstacle avoidance.
-
-### Discrete Actuator Control
-* **`POST /move`** — Commands the robot to move forward or backward by a specified distance with built-in collision back-off handling.
-* **`POST /turn`** — Rotates the robot by specified degrees.
-* **`POST /pickup`** — Initiates proximity checks and kinematic constraints to grab target objects within reach.
-* **`POST /drop`** — Places held objects down into designated drop zones.
-
-### Simulation & State Management
-* **`POST /reset`** — Resets the simulation arena, robot position, and object spawns.
-* **`POST /obstacle`** — Toggles dynamic obstacle mode within the arena.
-* **`GET /sync_status`** — Synchronizes states across distributed teammates' nodes.
-
-### Continuous Velocity & Motion
-* **`POST /move_start`** — Starts continuous linear velocity movement.
-* **`POST /turn_start`** — Starts continuous angular velocity rotation.
-* **`POST /stop`** — Instantly halts active wheel movement.
-
----
-
-## 🚀 Getting Started Locally
-
-### 1. Clone the Repository
-```bash
-git clone [https://github.com/Roshni-07/HackOween_Codejuring.git](https://github.com/Roshni-07/HackOween_Codejuring.git)
+```cmd
+git clone -b feature/roshni https://github.com/Roshni-07/HackOween_Codejuring.git
 cd HackOween_Codejuring
+```
+
+Create and activate a virtual environment, then install dependencies:
+
+```cmd
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+---
+
+## 2. Configure Your Anthropic API Key
+
+Create a file named `api_key.txt` in the root folder (`HackOween_Codejuring/api_key.txt`) and paste your Anthropic API key inside it (single line, no quotes):
+
+```cmd
+echo sk-ant-your-api-key-here> api_key.txt
+```
+
+*(Note: `api_key.txt` is listed in `.gitignore` so it will never be committed to Git).*
+
+---
+
+## 3. Run the System (3 Terminals)
+
+Open **three separate Command Prompt (`cmd`) terminals** inside the project directory (`HackOween_Codejuring`).
+
+### Terminal 1: PyBullet Simulation & FastAPI Backend (`server.py`)
+Starts the 3D PyBullet GUI arena and API server on `http://127.0.0.1:8000`:
+
+```cmd
+.\venv\Scripts\activate
+uvicorn server:app --reload --port 8000
+```
+
+### Terminal 2: Claude Vision Agent (`agent2.py`)
+Starts the interactive vision-language control loop:
+
+```cmd
+.\venv\Scripts\activate
+python agent2.py
+```
+
+When prompted with `Command:`, enter a natural language instruction—for example:
+- `Pick up the orange block and drop it in the pumpkin zone`
+- `Pick up the green cube and drop it in the pumpkin zone`
+- `Fetch the red sphere and place it in the pumpkin zone`
+
+**Interactive Controls in Terminal 2:**
+- After completing a task, `agent2.py` automatically prompts for your next command.
+- Type `reset` to return the robot to the center `(0, 0, 0)` and re-scatter the arena objects.
+- Type `exit` or `quit` to close the agent.
+
+### Terminal 3: Web Control & Live Visor Dashboard (`index.html`)
+Serves the browser dashboard on `http://127.0.0.1:5500`:
+
+```cmd
+python -m http.server 5500
+```
+
+Open **`http://127.0.0.1:5500/index.html`** in your browser to view the live **Visor Camera**, **Live Telemetry**, and manual WASD/Grab/Drop controls.
+
+---
+
+## Useful CLI Flags for `agent2.py`
+
+- **Test API key validity (free, 0 tokens):**
+  ```cmd
+  python agent2.py --check-key
+  ```
+- **Test robot movement & camera plumbing without API calls:**
+  ```cmd
+  python agent2.py --dummy
+  ```
+- **Verify server movement and camera frame updates:**
+  ```cmd
+  python agent2.py --selftest
+  ```
+- **Use a faster/cheaper Claude model:**
+  ```cmd
+  python agent2.py --model claude-haiku-5-5
+  ```
+
+---
+
+## Repository Structure
+
+- `server.py` — FastAPI server exposing `/look`, `/depth`, `/state`, `/move`, `/turn`, `/pickup`, `/drop`, and `/reset`.
+- `sim_engine.py` — PyBullet physics simulation engine, humanoid kinematics, and held-object + torso collision detection.
+- `sim/` — Modular simulation subsystems (`scene.py`, `driver.py`, `sensors.py`, `referee.py`).
+- `agent2.py` — Interactive Claude Vision agent with HUD overlay, odometry memory, and continuous command loop.
+- `index.html` — Live visor camera stream, telemetry viewer, and manual teleoperation dashboard.
